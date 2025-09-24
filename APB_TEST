@@ -1,0 +1,546 @@
+class APB_TEST extends uvm_test;
+  `uvm_component_utils(APB_TEST)
+  APB_ENV env;
+  APB_SEQUENCE sequences;
+  function new(string name="APB_TEST",uvm_component parent);
+    super.new(name,parent);
+  endfunction
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    env=APB_ENV::type_id::create("env",this);
+    sequences=APB_SEQUENCE::type_id::create("sequences",this);
+  endfunction
+  task run_phase(uvm_phase phase);
+    super.run_phase(phase);
+    phase.raise_objection(this);
+    sequences.start(env.agent.sequencer);
+    phase.drop_objection(this);
+  endtask
+endclass
+
+//env
+
+class APB_ENV extends uvm_env;
+  `uvm_component_utils(APB_ENV)
+  APB_AGENT agent;
+  APB_reference reference;
+  APB_SCOREBOARD scoreboard;
+  function new(string name="APB_ENV",uvm_component parent);
+    super.new(name,parent);
+  endfunction
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    agent=APB_AGENT::type_id::create("agent",this);
+    scoreboard=APB_SCOREBOARD::type_id::create("scoreboard",this);
+    reference=APB_reference::type_id::create("reference",this);
+  endfunction
+  function void connect_phase(uvm_phase phase);
+    super.connect_phase(phase);
+      agent.monitor.ap_port.connect(scoreboard.ap_port);
+      agent.monitor.ap_port.connect(reference.ap_port);
+       reference.put_port.connect(scoreboard.get_port);
+
+  endfunction
+
+//scoreboard
+
+class APB_SCOREBOARD extends uvm_scoreboard;
+
+  `uvm_component_utils(APB_SCOREBOARD)
+
+  // Receives DUT actual transactions (from monitor)
+  uvm_analysis_imp #(APB_TRANS, APB_SCOREBOARD) ap_port;
+
+  // Receives golden transactions (from reference model)
+  uvm_blocking_put_imp #(APB_TRANS, APB_SCOREBOARD) get_port;
+
+  // Queues to store transactions until match
+  APB_TRANS actual_q[$];
+  APB_TRANS expected_q[$];
+
+  //--------------------------------------------------------------------
+  // Constructor
+  //--------------------------------------------------------------------
+  function new(string name="APB_SCOREBOARD", uvm_component parent);
+    super.new(name, parent);
+    ap_port  = new("ap_port", this);
+    get_port = new("get_port", this);
+  endfunction
+
+  //--------------------------------------------------------------------
+  // Write: called when monitor sends DUT actual transaction
+  //--------------------------------------------------------------------
+  function void write(APB_TRANS trans);
+    actual_q.push_back(trans);
+    `uvm_info(get_type_name(),
+      $sformatf("SCOREBOARD: Received DUT transaction ADDR=0x%0h DATA=0x%0h",
+                trans.PADDR, (trans.PWRITE ? trans.PWDATA : trans.PRDATA)),
+      UVM_LOW)
+    compare();
+  endfunction
+
+  //--------------------------------------------------------------------
+  // Put: called when reference model sends golden transaction
+  //--------------------------------------------------------------------
+  task put(APB_TRANS ref_trans);
+    expected_q.push_back(ref_trans);
+    `uvm_info(get_type_name(),
+      $sformatf("SCOREBOARD: Received GOLDEN transaction ADDR=0x%0h DATA=0x%0h",
+                ref_trans.PADDR, ref_trans.PRDATA),
+      UVM_LOW)
+    compare();
+  endtask
+
+  //--------------------------------------------------------------------
+  // Compare DUT actual vs Reference expected
+  //--------------------------------------------------------------------
+  function void compare();
+    if (actual_q.size() > 0 && expected_q.size() > 0) begin
+      APB_TRANS act = actual_q.pop_front();
+      APB_TRANS exp = expected_q.pop_front();
+
+      if (!act.PWRITE) begin 
+        if (act.PRDATA !== exp.PRDATA) begin
+          `uvm_error(get_type_name(),
+            $sformatf("Mismatch at ADDR=0x%0h: Expected=0x%0h, Got=0x%0h",
+                      exp.PADDR, exp.PRDATA, act.PRDATA))
+        end else begin
+          `uvm_info(get_type_name(),
+                    $sformatf("Match at ADDR=0x%0h: DATA=0x%0h (PASS------------)",
+                      exp.PADDR, exp.PRDATA),
+            UVM_LOW)
+        end
+      end
+    end
+  endfunction
+
+endclass
+  
+endclass
+
+
+
+//reference model
+
+class APB_reference extends uvm_component;
+
+  `uvm_component_utils(APB_reference)
+
+  // Receives transactions from monitor
+  uvm_analysis_imp #(APB_TRANS, APB_reference) ap_port;
+
+  // Sends golden transactions to scoreboard
+  uvm_blocking_put_port #(APB_TRANS) put_port;
+
+  // Reference memory model (acts like DUT memory)
+  bit [`DATA_WIDTH-1:0] mem[int];  
+
+  //--------------------------------------------------------------------
+  // Constructor
+  //--------------------------------------------------------------------
+  function new(string name="APB_reference", uvm_component parent);
+    super.new(name, parent);
+    ap_port   = new("ap_port", this);
+    put_port  = new("put_port", this);
+  endfunction
+
+  //--------------------------------------------------------------------
+  // Write method: called by analysis imp
+  //--------------------------------------------------------------------
+  function void write(APB_TRANS trans);
+
+    APB_TRANS ref_trans;
+    ref_trans = APB_TRANS::type_id::create("ref_trans");
+  //  ref_trans.copy(trans);
+
+    if (trans.PWRITE) begin
+      // -----------------------------
+      // WRITE transaction: update memory
+      // -----------------------------
+      mem[trans.PADDR] = trans.PWDATA;
+
+      `uvm_info(get_type_name(),
+        $sformatf("Reference Model WRITE stored: ADDR=0x%0h DATA=0x%0h",
+                  trans.PADDR, trans.PWDATA),
+        UVM_MEDIUM)
+
+    end else begin
+      // -----------------------------
+      // READ transaction: generate expected PRDATA
+      // -----------------------------
+      if (mem.exists(trans.PADDR))
+        ref_trans.PRDATA = mem[trans.PADDR];
+      else
+        ref_trans.PRDATA = '0;
+
+      `uvm_info(get_type_name(),
+        $sformatf("Reference Model READ expected: ADDR=0x%0h DATA=0x%0h",
+                  trans.PADDR, ref_trans.PRDATA),
+        UVM_MEDIUM)
+
+      // -----------------------------
+      // Since put_port.put() is blocking,
+      // call it asynchronously
+      // -----------------------------
+      fork
+        automatic APB_TRANS tmp = ref_trans;
+        put_port.put(tmp);
+      join_none
+    end
+
+  endfunction
+
+endclass
+
+
+//agent
+
+class APB_AGENT extends uvm_agent;
+
+  //--------------------------------------------------------------------
+  // Factory Registration
+  //--------------------------------------------------------------------
+  `uvm_component_utils(APB_AGENT)
+
+  //--------------------------------------------------------------------
+  // Sub-components
+  //--------------------------------------------------------------------
+  APB_DRIVER    driver;
+  APB_MONITOR   monitor;
+  APB_SEQUENCER sequencer;
+
+  //--------------------------------------------------------------------
+  // Constructor
+  //--------------------------------------------------------------------
+  function new(string name = "APB_AGENT", uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  //--------------------------------------------------------------------
+  // Build Phase
+  //--------------------------------------------------------------------
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+
+    // Always create monitor (even in passive mode)
+    monitor   = APB_MONITOR::type_id::create("monitor", this);
+      driver    = APB_DRIVER::type_id::create("driver", this);
+      sequencer = APB_SEQUENCER::type_id::create("sequencer", this);
+  endfunction
+
+  //--------------------------------------------------------------------
+  // Connect Phase
+  //--------------------------------------------------------------------
+  function void connect_phase(uvm_phase phase);
+    super.connect_phase(phase);
+      driver.seq_item_port.connect(sequencer.seq_item_export);
+  endfunction
+
+endclass
+
+
+//monitor
+class APB_MONITOR extends uvm_monitor;
+
+  //--------------------------------------------------------------------
+  // Factory Registration
+  //--------------------------------------------------------------------
+  `uvm_component_utils(APB_MONITOR)
+
+  //--------------------------------------------------------------------
+  // Ports and Variables
+  //--------------------------------------------------------------------
+  uvm_analysis_port #(APB_TRANS) ap_port;   // Analysis port to broadcast transactions
+  APB_TRANS req;                            // Transaction handle
+  virtual intf inf;                         // Virtual interface handle
+
+  //--------------------------------------------------------------------
+  // Constructor
+  //--------------------------------------------------------------------
+  function new(string name = "APB_MONITOR", uvm_component parent);
+    super.new(name, parent);
+    ap_port = new("ap_port", this);
+  endfunction
+
+  //--------------------------------------------------------------------
+  // Build Phase
+  //--------------------------------------------------------------------
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+
+    if (!uvm_config_db#(virtual intf)::get(this, "", "inf", inf)) begin
+      `uvm_fatal(get_type_name(), "Interface not set in config DB")
+    end
+
+    `uvm_info(get_type_name(), "Build phase completed, interface received", UVM_LOW)
+  endfunction
+
+  //--------------------------------------------------------------------
+  // Run Phase
+  //--------------------------------------------------------------------
+  task run_phase(uvm_phase phase);
+    `uvm_info(get_type_name(), "Run phase started", UVM_LOW)
+    forever begin
+      get_from_dut();
+    end
+  endtask
+
+  //--------------------------------------------------------------------
+  // Task: get_from_dut
+  // Description: Captures transactions from DUT and sends via analysis port
+  //--------------------------------------------------------------------
+  task get_from_dut();
+//     // Wait until valid APB transfer occurs
+    @((inf.MON_CB) iff (inf.MON_CB.PSEL && inf.MON_CB.PENABLE && inf.MON_CB.PREADY));
+    `uvm_info(get_type_name(),"Monitor Invoked",UVM_LOW)
+
+    // Create transaction
+    req = APB_TRANS::type_id::create("req");
+
+    // Sample signals
+    req.PADDR   = inf.MON_CB.PADDR;
+    req.PWRITE  = inf.MON_CB.PWRITE;
+    req.PSLVERR = inf.MON_CB.PSLVERR;
+
+    if (inf.MON_CB.PWRITE) begin
+      req.PWDATA = inf.MON_CB.PWDATA;
+      `uvm_info(get_type_name(), $sformatf("Captured WRITE to addr=0x%0h data=0x%0h", 
+                                           req.PADDR, req.PWDATA), UVM_MEDIUM)
+    end
+    else begin
+      req.PRDATA = inf.MON_CB.PRDATA;
+      `uvm_info(get_type_name(), $sformatf("Captured READ from addr=0x%0h data=0x%0h", 
+                                           req.PADDR, req.PRDATA), UVM_MEDIUM)
+    end
+
+    // Send transaction via analysis port
+    ap_port.write(req);
+
+    // Debug print
+    req.print();
+  endtask
+
+endclass
+
+
+
+//driver
+
+
+class APB_DRIVER extends uvm_driver #(APB_TRANS);
+
+  //--------------------------------------------------------------------
+  // Factory Registration
+  //--------------------------------------------------------------------
+  `uvm_component_utils(APB_DRIVER)
+
+  //--------------------------------------------------------------------
+  // Data Members
+  //--------------------------------------------------------------------
+  virtual intf inf;    // Virtual interface handle
+  APB_TRANS req;       // Transaction handle
+
+  //--------------------------------------------------------------------
+  // Constructor
+  //--------------------------------------------------------------------
+  function new(string name = "APB_DRIVER", uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  //--------------------------------------------------------------------
+  // Build Phase
+  //--------------------------------------------------------------------
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+
+    if(!uvm_config_db#(virtual intf)::get(this, "", "inf", inf))
+      `uvm_fatal(get_type_name(), "Interface not set in config DB")
+  endfunction
+
+  //--------------------------------------------------------------------
+  // Run Phase
+  //--------------------------------------------------------------------
+  task run_phase(uvm_phase phase);
+    forever begin
+      seq_item_port.get_next_item(req);
+      send_to_dut(req);
+      seq_item_port.item_done();
+    end
+  endtask
+
+  //--------------------------------------------------------------------
+  // Drive Task : Implements APB handshake
+  //--------------------------------------------------------------------
+  task send_to_dut(APB_TRANS req);
+
+    // -----------------------------
+    // SETUP PHASE (PSEL=1, PENABLE=0)
+    // -----------------------------
+    @(posedge inf.PCLK);
+    inf.DRV_CB.PADDR   <= req.PADDR;
+    inf.DRV_CB.PWDATA  <= req.PWDATA;
+    inf.DRV_CB.PWRITE  <= req.PWRITE;
+    inf.DRV_CB.PSEL    <= 1;
+    inf.DRV_CB.PENABLE <= 0;
+    inf.DRV_CB.PRESETn <= 1;
+
+    // -----------------------------
+    // ENABLE PHASE (PENABLE=1, wait for PREADY)
+    // -----------------------------
+    @(posedge inf.PCLK);
+    inf.DRV_CB.PENABLE <= 1;
+
+   // Wait until slave is ready
+   wait (inf.DRV_CB.PREADY == 1);
+
+//     -----------------------------
+//     Complete transfer: deassert signals
+//     -----------------------------
+   // @(posedge inf.PCLK);
+    inf.DRV_CB.PSEL    <= 1;
+    inf.DRV_CB.PENABLE <= 0;
+
+    `uvm_info(get_type_name(),
+      $sformatf("APB %s transfer completed: ADDR=0x%0h, DATA=0x%0h",
+                 (req.PWRITE ? "WRITE" : "READ"),
+                 req.PADDR,
+                 (req.PWRITE ? req.PWDATA : inf.DRV_CB.PRDATA)),
+      UVM_MEDIUM)
+
+  endtask
+
+endclass
+
+//sequencer
+
+
+class APB_SEQUENCER extends uvm_sequencer #(APB_TRANS);
+  `uvm_component_utils(APB_SEQUENCER)
+
+  function new(string name="APB_SEQUENCER",uvm_component parent);
+    super.new(name,parent);
+  endfunction
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+  endfunction
+  
+endclass
+
+//sequence
+
+class APB_SEQUENCE extends uvm_sequence #(APB_TRANS);
+
+  //--------------------------------------------------------------------
+  // Factory Registration
+  //--------------------------------------------------------------------
+  `uvm_object_utils(APB_SEQUENCE)
+
+  //--------------------------------------------------------------------
+  // Data Members
+  //--------------------------------------------------------------------
+  APB_TRANS trans;   // Transaction handle
+
+  //--------------------------------------------------------------------
+  // Constructor
+  //--------------------------------------------------------------------
+  function new(string name = "APB_SEQUENCE");
+    super.new(name);
+  endfunction
+
+  //--------------------------------------------------------------------
+  // Body Task
+  //--------------------------------------------------------------------
+  task body();
+    repeat (10) begin
+      // Create transaction
+      trans = APB_TRANS::type_id::create("trans");
+
+      `uvm_info(get_type_name(), "Task Body Called", UVM_LOW)
+
+      // Start transaction
+      start_item(trans);
+
+      // Randomize transaction
+      if (!trans.randomize())
+        `uvm_fatal(get_type_name(), "Randomization Failure")
+
+      // Finish transaction (must always be called after start_item)
+      finish_item(trans);
+
+      trans.print();
+    end
+  endtask
+
+endclass
+
+
+
+//transaction
+
+class APB_TRANS extends uvm_sequence_item;
+
+  //--------------------------------------------------------------------
+  // Data Members
+  //--------------------------------------------------------------------
+  rand bit [`ADDR_WIDTH-1:0] PADDR;    // Address
+  rand bit [`DATA_WIDTH-1:0] PWDATA;   // Write Data
+       bit [`DATA_WIDTH-1:0] PRDATA;   // Read Data (from DUT)
+       bit PREADY;                     // Ready signal
+       bit PSEL;                       // Select signal
+       bit PENABLE;                    // Enable signal
+       bit PSLVERR;                    // Error response
+  rand bit PWRITE;                     // Write control (1=Write, 0=Read)
+
+  //--------------------------------------------------------------------
+  // Constructor
+  //--------------------------------------------------------------------
+  function new(string name = "APB_TRANS");
+    super.new(name);
+  endfunction
+
+  //--------------------------------------------------------------------
+  // UVM Factory Registration & Field Automation
+  //--------------------------------------------------------------------
+  `uvm_object_utils_begin(APB_TRANS)
+    `uvm_field_int(PADDR,   UVM_ALL_ON + UVM_DEC)
+    `uvm_field_int(PWDATA,  UVM_ALL_ON + UVM_DEC)
+    `uvm_field_int(PRDATA,  UVM_ALL_ON + UVM_DEC)
+    `uvm_field_int(PSEL,    UVM_ALL_ON + UVM_DEC)
+    `uvm_field_int(PENABLE, UVM_ALL_ON + UVM_DEC)
+    `uvm_field_int(PSLVERR, UVM_ALL_ON + UVM_DEC)
+    `uvm_field_int(PREADY,  UVM_ALL_ON + UVM_DEC)
+    `uvm_field_int(PWRITE,  UVM_ALL_ON + UVM_DEC)
+  `uvm_object_utils_end
+  
+  constraint address_range
+  {
+    soft PADDR inside {[0:1]};
+  }
+
+  constraint PWRITE_logic
+  {
+    PWRITE dist {1:=70,0:=30};
+  }
+endclass
+
+
+//package 
+
+
+`include "APB_DEFINE.sv"
+`include "APB_INTERFACE.sv"
+package pkg;
+`include "uvm_macros.svh"
+import uvm_pkg::*;
+`include "APB_TRANS.sv"
+`include "APB_SEQUENCE.sv"
+`include "APB_SEQUENCER.sv"
+`include "APB_DRIVER.sv"
+`include "APB_MONITOR.sv"
+`include "APB_AGENT.sv"
+`include "APB_reference_model.sv"
+`include "APB_SCOREBOARD.sv"
+`include "APB_ENV.sv"
+`include "APB_TEST.sv"
+
+endpackage
